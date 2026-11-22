@@ -1,162 +1,32 @@
 name: Continuum release
-
-# Builds Continuum IDE installers on GitHub-hosted runners and publishes them as a
-# GitHub Release of this repository. Upstream T3 Code's release.yml signs with
-# T3's certificates and publishes to T3's channels; it is disabled in this fork.
-#
-# Run it from the Actions tab (workflow_dispatch) with a version such as 0.1.0, or
-# push a tag such as v0.1.0. Installers are unsigned unless signing secrets are added.
-
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches: [release/windows-preview-2]
   workflow_dispatch:
-    inputs:
-      version:
-        description: Version to build, without the leading v (for example 0.1.0)
-        required: true
-        type: string
-      publish:
-        description: Publish a GitHub Release (otherwise only upload workflow artifacts)
-        required: false
-        default: true
-        type: boolean
-      prerelease:
-        description: Mark the GitHub Release as a prerelease
-        required: false
-        default: true
-        type: boolean
-
 permissions:
   contents: read
-
-concurrency:
-  group: continuum-release-${{ github.ref }}
-  cancel-in-progress: false
-
 env:
-  VERSION: ${{ inputs.version || github.ref_name }}
-
+  VERSION: 0.2.0-preview.2
 jobs:
   package:
-    name: Package ${{ matrix.label }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: Linux x64 (AppImage, deb, rpm)
-            runner: ubuntu-24.04
-            platform: linux
-            target: AppImage
-            arch: x64
-          - label: Windows x64 (NSIS installer)
-            runner: windows-2025
-            platform: win
-            target: nsis
-            arch: x64
-          - label: macOS Apple silicon (dmg, zip)
-            runner: macos-15
-            platform: mac
-            target: dmg
-            arch: arm64
-          - label: macOS Intel (dmg, zip)
-            runner: macos-15-intel
-            platform: mac
-            target: dmg
-            arch: x64
+    runs-on: windows-2025
+    timeout-minutes: 45
     steps:
-      - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-
-      - name: Resolve version
-        id: version
-        shell: bash
-        run: |
-          version="${VERSION#v}"
-          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Version '$version' is not semver (expected X.Y.Z or X.Y.Z-suffix)."
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - name: Setup Vite+ and dependencies
-        uses: ./.github/actions/setup-ci-deps
-
-      - name: Install Linux build tools
-        if: matrix.platform == 'linux'
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config imagemagick rpm
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - uses: ./.github/actions/setup-ci-deps
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: stable
-
-      - name: Install Electron runtime
-        run: vp run --filter @t3tools/desktop ensure:electron
-
-      - name: Align package versions to the release version
-        run: node scripts/update-release-package-versions.ts "${{ steps.version.outputs.version }}"
-
-      # GITHUB_REPOSITORY makes the update feed point at this repository's releases.
-      - name: Build installer
+      - run: vp run --filter @t3tools/desktop ensure:electron
+      - shell: bash
+        run: node scripts/update-release-package-versions.ts "$VERSION"
+      - name: Build Windows x64 installer
         shell: bash
         env:
-          T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: SwashX-dev/continuum-ide
           T3CODE_TELEMETRY_CHANNEL: dev
-        run: >-
-          vp run dist:desktop:artifact
-          --platform ${{ matrix.platform }}
-          --target ${{ matrix.target }}
-          --arch ${{ matrix.arch }}
-          --build-version ${{ steps.version.outputs.version }}
-          --verbose
-
-      - name: Add an RPM package
-        if: matrix.platform == 'linux'
-        shell: bash
-        env:
-          T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
-          T3CODE_TELEMETRY_CHANNEL: dev
-        run: |
-          set -euo pipefail
-          manifest=release/latest-linux.yml
-          saved="$RUNNER_TEMP/continuum-appimage-update.yml"
-          if [ -f "$manifest" ]; then cp "$manifest" "$saved"; fi
-          # Electron Builder's second packaging pass writes the same updater manifest for RPM.
-          trap 'if [ -f "$saved" ]; then mv "$saved" "$manifest"; else rm -f "$manifest"; fi' EXIT
-          vp run dist:desktop:artifact \
-            --platform linux --target rpm --arch x64 \
-            --build-version "${{ steps.version.outputs.version }}" --skip-build --verbose
-        continue-on-error: true
-
-      - name: Verify the Linux packages are Continuum's
-        if: matrix.platform == 'linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          ls -l release
-          test -f release/Continuum-IDE-x86_64.AppImage
-          test -f release/Continuum-IDE-amd64.deb
-          test "$(dpkg-deb --field release/Continuum-IDE-amd64.deb Package)" = "continuum-ide"
-          # Capture first: grep -q exits early and pipefail would fail dpkg-deb on the broken pipe.
-          contents="$(dpkg-deb --contents release/Continuum-IDE-amd64.deb)"
-          grep -q "io.github.swashxdev.continuumide.metainfo.xml" <<<"$contents"
-          if [ -f release/latest-linux.yml ]; then grep -q "Continuum-IDE-x86_64.AppImage" release/latest-linux.yml; fi
-
-      - name: Verify the Windows installer is Continuum's
-        if: matrix.platform == 'win'
-        shell: bash
-        run: |
-          set -euo pipefail
-          ls -l release
-          test -f release/Continuum-IDE-Setup-x64.exe
-          if [ -f release/latest.yml ]; then grep -q "Continuum-IDE-Setup-x64.exe" release/latest.yml; fi
-
-      - name: Install and launch the Windows package
-        if: matrix.platform == 'win'
+        run: vp run dist:desktop:artifact --platform win --target nsis --arch x64 --build-version "$VERSION" --verbose
+      - name: Install and launch the packaged app
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -173,10 +43,7 @@ jobs:
               if ($process.HasExited) { throw "Continuum exited with code $($process.ExitCode)" }
               try {
                 $pages = Invoke-RestMethod 'http://127.0.0.1:9224/json/list' -TimeoutSec 2
-                if ($pages | Where-Object { $_.type -eq 'page' -and $_.title -like '*Continuum*' }) {
-                  Write-Output 'Windows installer installed and launched the Continuum renderer.'
-                  exit 0
-                }
+                if ($pages | Where-Object { $_.type -eq 'page' -and $_.title -like '*Continuum*' }) { exit 0 }
               } catch {}
               Start-Sleep -Seconds 1
             }
@@ -184,100 +51,30 @@ jobs:
           } finally {
             if (!$process.HasExited) { Stop-Process -Id $process.Id }
           }
-
-      # Installs this build through the same Homebrew cask users get (pointed at the local
-      # file), launches it with `contin`, and uninstalls it. A failure blocks publishing.
-      - name: Verify the macOS app installs and launches through Homebrew
-        if: matrix.platform == 'mac'
-        shell: bash
-        run: |
-          set -euo pipefail
-          ls -l release
-          version="${{ steps.version.outputs.version }}"
-          dmg="release/Continuum-IDE-${version}-${{ matrix.arch }}.dmg"
-          test -f "$dmg"
-          test -f "release/Continuum-IDE-${version}-${{ matrix.arch }}.zip"
-          sha="$(shasum -a 256 "$dmg" | cut -d' ' -f1)"
-          # Only this Mac's architecture is installed here; the other gets a placeholder checksum.
-          placeholder="$(printf '0%.0s' {1..64})"
-          if [ "${{ matrix.arch }}" = "arm64" ]; then arm="$sha"; x64="$placeholder"; else arm="$placeholder"; x64="$sha"; fi
-          packaging/homebrew/render-cask.sh "$version" "$arm" "$x64" "file://$PWD/release" > "$RUNNER_TEMP/continuum-ide.rb"
-          packaging/homebrew/verify-macos-install.sh "$RUNNER_TEMP/continuum-ide.rb"
-          # Both Mac builds write latest-mac.yml; keep each and merge them when publishing.
-          if [ -f release/latest-mac.yml ]; then mv release/latest-mac.yml "release/latest-mac-${{ matrix.arch }}.yml"; fi
-
-      - name: Upload installers
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: continuum-${{ matrix.platform }}-${{ matrix.arch }}
+          name: continuum-win-x64
           path: |
-            release/*.AppImage
-            release/*.deb
-            release/*.rpm
-            release/*.exe
-            release/*.dmg
-            release/*.zip
-            release/*.blockmap
-            release/latest*.yml
+            release/Continuum-IDE-Setup-x64.exe
+            release/Continuum-IDE-Setup-x64.exe.blockmap
+            release/latest.yml
           if-no-files-found: error
-          retention-days: 14
-
   publish:
-    name: Publish GitHub Release
     needs: package
-    if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-
-      - name: Download installers
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          pattern: continuum-*
+          name: continuum-win-x64
           path: dist
-          merge-multiple: true
-
-      - name: Merge the macOS update manifests
-        run: |
-          set -euo pipefail
-          cd dist
-          if [ -f latest-mac-arm64.yml ] && [ -f latest-mac-x64.yml ]; then
-            node <<'NODE'
-              const fs = require("node:fs");
-              const read = (f) => fs.readFileSync(f, "utf8");
-              const arm = read("latest-mac-arm64.yml");
-              const head = arm.split("\nfiles:\n")[0];
-              const tail = arm.split("\nfiles:\n")[1].split("\npath:")[1];
-              const armFiles = arm.split("\nfiles:\n")[1].split("\npath:")[0];
-              const x64Files = read("latest-mac-x64.yml").split("\nfiles:\n")[1].split("\npath:")[0];
-              fs.writeFileSync("latest-mac.yml", `${head}\nfiles:\n${armFiles}\n${x64Files}\npath:${tail}`);
-          NODE
-            rm latest-mac-arm64.yml latest-mac-x64.yml
-            cat latest-mac.yml
-          fi
-
-      - name: Write checksums
-        run: |
-          cd dist
-          sha256sum -- * > SHA256SUMS
-          cat SHA256SUMS
-
-      - name: Create release
+      - name: Publish the verified installer and checksums
         env:
           GH_TOKEN: ${{ github.token }}
-          PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || contains(github.ref_name, '-') }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          version="${VERSION#v}"
-          tag="v${version}"
-          flags=(--title "Continuum IDE ${version}" --notes-file .github/continuum-release-notes.md)
-          if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); else flags+=(--latest); fi
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then flags+=(--target "${{ github.sha }}"); fi
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
-          else
-            gh release create "$tag" dist/* "${flags[@]}"
-          fi
+          grep -Fq Continuum-IDE-Setup-x64.exe dist/latest.yml
+          (cd dist && sha256sum -- Continuum-IDE-Setup-x64.exe Continuum-IDE-Setup-x64.exe.blockmap latest.yml > SHA256SUMS)
+          gh release create "v$VERSION" dist/* --target "$GITHUB_SHA" --prerelease --title "Continuum IDE $VERSION for Windows" --notes 'Windows x64 preview of the Continuum game development update. Download Continuum-IDE-Setup-x64.exe to install. The installer is unsigned. SHA256SUMS lists the asset checksums.'
